@@ -1,608 +1,302 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-)
+"""
+EV CHARGING DEMAND PREDICTION DASHBOARD
+======================================
+Run:
+    python -m pip install streamlit pandas matplotlib
+    python -m streamlit run app.py
 
-# ---------------------------------------------------------
-# PAGE SETTINGS
-# ---------------------------------------------------------
+Use EV_Charging_Dashboard_Ready.csv, or upload an EV charging CSV.
+The Run analysis button loads the selected dataset. The Apply filters button
+applies the location and charger-type filters.
+"""
+
+from pathlib import Path
+import hashlib
+
+import pandas as pd
+import streamlit as st
+
+# ------------------------------------------------------------
+# 1. Page setup
+# ------------------------------------------------------------
 st.set_page_config(
-    page_title="EV Charging Demand Prediction",
-    page_icon="🔋",
+    page_title="EV Charging Demand Dashboard",
+    page_icon="⚡",
     layout="wide",
 )
 
-# ---------------------------------------------------------
-# HELPER FUNCTIONS
-# ---------------------------------------------------------
-def find_column(dataframe, possible_names):
-    """Return the first matching column from a list of possible names."""
-    lower_columns = {column.lower(): column for column in dataframe.columns}
+st.title("⚡ EV Charging Demand Prediction Dashboard")
+st.caption("Explore charging demand by time, location, and charger type.")
 
-    for name in possible_names:
-        if name.lower() in lower_columns:
-            return lower_columns[name.lower()]
+APP_FOLDER = Path(__file__).resolve().parent
+DEFAULT_FILE = APP_FOLDER / "EV_Charging_Dashboard_Ready.csv"
 
-    return None
+# Keep the last successfully loaded dataset while users change filters.
+if "ev_source_df" not in st.session_state:
+    st.session_state["ev_source_df"] = None
+if "ev_source_name" not in st.session_state:
+    st.session_state["ev_source_name"] = None
+if "ev_source_signature" not in st.session_state:
+    st.session_state["ev_source_signature"] = None
+if "ev_filters" not in st.session_state:
+    st.session_state["ev_filters"] = None
 
-
-def prepare_data(dataframe):
-    """Clean the uploaded EV charging dataset and create useful features."""
-    df = dataframe.copy()
-
-    # Remove completely empty rows and duplicate rows.
-    df = df.dropna(how="all")
-    df = df.drop_duplicates()
-
-    # Detect important columns.
-    demand_col = find_column(df, ["Demand", "demand", "Energy", "energy"])
-    start_datetime_col = find_column(
-        df,
-        ["StartDatetime", "StartDateTime", "Start DateTime", "start_datetime"],
-    )
-    start_day_col = find_column(df, ["StartDay", "Start Date", "Date", "date"])
-    start_time_col = find_column(df, ["StartTime", "Start Time", "time"])
-    duration_col = find_column(df, ["Duration", "duration"])
-
-    # Convert demand to numeric when available.
-    if demand_col:
-        df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce")
-
-    # Create a datetime column.
-    datetime_created = False
-
-    if start_datetime_col:
-        df["AnalysisDatetime"] = pd.to_datetime(
-            df[start_datetime_col], errors="coerce"
-        )
-        datetime_created = df["AnalysisDatetime"].notna().any()
-
-    if not datetime_created and start_day_col:
-        if start_time_col:
-            combined = (
-                df[start_day_col].astype(str)
-                + " "
-                + df[start_time_col].astype(str)
-            )
-            df["AnalysisDatetime"] = pd.to_datetime(
-                combined, errors="coerce"
-            )
-        else:
-            df["AnalysisDatetime"] = pd.to_datetime(
-                df[start_day_col], errors="coerce"
-            )
-
-    # Create duration when it is not already available.
-    if duration_col is None:
-        end_datetime_col = find_column(
-            df,
-            ["EndDatetime", "EndDateTime", "End DateTime", "end_datetime"],
-        )
-
-        if start_datetime_col and end_datetime_col:
-            start = pd.to_datetime(df[start_datetime_col], errors="coerce")
-            end = pd.to_datetime(df[end_datetime_col], errors="coerce")
-            df["Duration"] = (end - start).dt.total_seconds() / 60
-            duration_col = "Duration"
-
-    if duration_col:
-        df[duration_col] = pd.to_numeric(df[duration_col], errors="coerce")
-
-    # Create time-based features.
-    if "AnalysisDatetime" in df.columns:
-        df["Hour"] = df["AnalysisDatetime"].dt.hour
-        df["DayOfWeek"] = df["AnalysisDatetime"].dt.dayofweek
-        df["Month"] = df["AnalysisDatetime"].dt.month
-        df["Day"] = df["AnalysisDatetime"].dt.day
-        df["IsWeekend"] = df["DayOfWeek"].isin([5, 6]).astype(int)
-
-    return df, demand_col, duration_col
-
-
-def numeric_features(df, target_column):
-    """Return numeric predictor columns suitable for machine learning."""
-    numeric_df = df.select_dtypes(include=np.number).copy()
-
-    if target_column in numeric_df.columns:
-        numeric_df = numeric_df.drop(columns=[target_column])
-
-    # Remove columns that are unlikely to be useful predictors.
-    ignored = [
-        "ChargingsessionID",
-        "UserID",
-        "ChargerID",
-    ]
-
-    numeric_df = numeric_df.drop(
-        columns=[column for column in ignored if column in numeric_df.columns],
-        errors="ignore",
-    )
-
-    return numeric_df
-
-
-# ---------------------------------------------------------
-# TITLE
-# ---------------------------------------------------------
-st.title("🔋 EV Charging Demand Prediction and Usage Pattern Analysis")
-st.write(
-    "Analyze EV charging usage patterns and predict charging demand "
-    "using an uploaded CSV dataset."
-)
-
-st.divider()
-
-# ---------------------------------------------------------
-# CSV UPLOAD
-# ---------------------------------------------------------
-st.sidebar.header("📁 Dataset")
+# ------------------------------------------------------------
+# 2. Dataset selection and explicit Run Analysis button
+# ------------------------------------------------------------
+st.sidebar.header("Dataset")
 
 uploaded_file = st.sidebar.file_uploader(
     "Upload EV charging CSV",
     type=["csv"],
+    help="Upload EV_Charging_Dashboard_Ready.csv or another CSV with Demand, Location, and ChargerType columns.",
 )
 
-if uploaded_file is None:
-    st.info(
-        "Please upload an EV charging CSV file from the sidebar to start "
-        "the analysis."
-    )
-    st.stop()
-
-try:
-    raw_df = pd.read_csv(uploaded_file)
-except Exception as error:
-    st.error(f"Unable to read the CSV file: {error}")
-    st.stop()
-
-df, demand_col, duration_col = prepare_data(raw_df)
-
-if df.empty:
-    st.error("The uploaded CSV does not contain usable rows.")
-    st.stop()
-
-if demand_col is None:
-    st.error(
-        "A Demand column is required for this project. "
-        "Please upload a CSV containing a Demand column."
-    )
-    st.stop()
-
-df = df.dropna(subset=[demand_col])
-
-if df.empty:
-    st.error("No valid numeric Demand values were found in the uploaded CSV.")
-    st.stop()
-
-# ---------------------------------------------------------
-# SIDEBAR INFORMATION
-# ---------------------------------------------------------
-st.sidebar.success("CSV uploaded successfully.")
-st.sidebar.write(f"Rows: {len(df):,}")
-st.sidebar.write(f"Columns: {len(df.columns):,}")
-
-location_col = find_column(df, ["Location"])
-charger_type_col = find_column(df, ["ChargerType", "Charger Type"])
-company_col = find_column(df, ["ChargerCompany", "Charger Company"])
-
-# ---------------------------------------------------------
-# 1. DATASET OVERVIEW
-# ---------------------------------------------------------
-st.header("1. Dataset Overview")
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Charging Sessions", f"{len(df):,}")
-col2.metric("Average Demand", f"{df[demand_col].mean():.2f}")
-col3.metric(
-    "Average Duration",
-    f"{df[duration_col].mean():.2f}" if duration_col else "N/A",
-)
-col4.metric(
-    "Locations",
-    f"{df[location_col].nunique():,}" if location_col else "N/A",
-)
-
-st.dataframe(df.head(10), width="stretch", height=300)
-
-# ---------------------------------------------------------
-# 2. DATA QUALITY
-# ---------------------------------------------------------
-st.header("2. Data Quality")
-
-quality_col1, quality_col2, quality_col3 = st.columns(3)
-
-quality_col1.metric(
-    "Missing Values",
-    f"{int(df.isna().sum().sum()):,}",
-)
-
-quality_col2.metric(
-    "Duplicate Rows",
-    f"{int(df.duplicated().sum()):,}",
-)
-
-quality_col3.metric(
-    "Number of Columns",
-    f"{len(df.columns):,}",
-)
-
-missing_df = (
-    df.isna()
-    .sum()
-    .reset_index()
-    .rename(columns={"index": "Column", 0: "Missing Values"})
-)
-
-missing_df = missing_df[missing_df["Missing Values"] > 0]
-
-if missing_df.empty:
-    st.success("No missing values remain in the prepared dataset.")
+if uploaded_file is not None:
+    selected_name = uploaded_file.name
+    file_bytes = uploaded_file.getvalue()
+    signature = hashlib.md5(file_bytes).hexdigest()
+    source_kind = "upload"
+elif DEFAULT_FILE.exists():
+    selected_name = DEFAULT_FILE.name
+    file_bytes = DEFAULT_FILE.read_bytes()
+    signature = hashlib.md5(file_bytes).hexdigest()
+    source_kind = "default"
+    st.sidebar.success(f"Default dataset found: {selected_name}")
 else:
-    st.dataframe(missing_df, width="stretch", height=220)
+    selected_name = None
+    file_bytes = None
+    signature = None
+    source_kind = None
+    st.sidebar.info("Upload a CSV file to begin.")
 
-# ---------------------------------------------------------
-# 3. EDA
-# ---------------------------------------------------------
-st.header("3. Exploratory Data Analysis")
+run_analysis = st.sidebar.button(
+    "▶ Run analysis",
+    type="primary",
+    use_container_width=True,
+    disabled=file_bytes is None,
+)
 
-eda_left, eda_right = st.columns(2)
+if run_analysis and file_bytes is not None:
+    try:
+        from io import BytesIO
 
-with eda_left:
-    if location_col:
-        location_data = (
-            df.groupby(location_col)[demand_col]
-            .mean()
-            .reset_index()
-            .sort_values(demand_col, ascending=False)
-        )
+        loaded = pd.read_csv(BytesIO(file_bytes), low_memory=False)
+        loaded.columns = [str(c).strip() for c in loaded.columns]
+        loaded = loaded.dropna(how="all").drop_duplicates().copy()
 
-        fig = px.bar(
-            location_data,
-            x=location_col,
-            y=demand_col,
-            title="Average Demand by Location",
-            labels={demand_col: "Average Demand"},
-        )
-        fig.update_layout(height=350)
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.info("Location column not available.")
+        required = ["Demand", "Location", "ChargerType"]
+        missing = [c for c in required if c not in loaded.columns]
 
-with eda_right:
-    if charger_type_col:
-        charger_data = (
-            df.groupby(charger_type_col)[demand_col]
-            .mean()
-            .reset_index()
-        )
-
-        fig = px.bar(
-            charger_data,
-            x=charger_type_col,
-            y=demand_col,
-            title="Average Demand by Charger Type",
-            labels={demand_col: "Average Demand"},
-        )
-        fig.update_layout(height=350)
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.info("ChargerType column not available.")
-
-if "Hour" in df.columns:
-    hourly_data = (
-        df.groupby("Hour")[demand_col]
-        .mean()
-        .reset_index()
-    )
-
-    fig = px.line(
-        hourly_data,
-        x="Hour",
-        y=demand_col,
-        markers=True,
-        title="Average Demand by Hour",
-        labels={demand_col: "Average Demand"},
-    )
-    fig.update_layout(height=350)
-    st.plotly_chart(fig, width="stretch")
-
-# ---------------------------------------------------------
-# 4. REGRESSION
-# ---------------------------------------------------------
-st.header("4. Regression - Demand Prediction")
-
-reg_features = numeric_features(df, demand_col)
-
-if len(reg_features.columns) >= 1 and len(df) >= 10:
-    reg_data = pd.concat([reg_features, df[demand_col]], axis=1).dropna()
-
-    if len(reg_data) >= 10:
-        X = reg_data.drop(columns=[demand_col])
-        y = reg_data[demand_col]
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=42,
-        )
-
-        reg_model = RandomForestRegressor(
-            n_estimators=100,
-            random_state=42,
-        )
-        reg_model.fit(X_train, y_train)
-        reg_predictions = reg_model.predict(X_test)
-
-        mae = mean_absolute_error(y_test, reg_predictions)
-        rmse = np.sqrt(mean_squared_error(y_test, reg_predictions))
-        r2 = r2_score(y_test, reg_predictions)
-
-        metric1, metric2, metric3 = st.columns(3)
-        metric1.metric("MAE", f"{mae:.2f}")
-        metric2.metric("RMSE", f"{rmse:.2f}")
-        metric3.metric("R² Score", f"{r2:.2f}")
-
-        comparison = pd.DataFrame(
-            {
-                "Actual Demand": y_test.values,
-                "Predicted Demand": reg_predictions,
-            }
-        )
-
-        fig = px.scatter(
-            comparison,
-            x="Actual Demand",
-            y="Predicted Demand",
-            title="Actual vs Predicted Demand",
-        )
-        fig.update_layout(height=350)
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.warning("Not enough valid numeric data for regression.")
-else:
-    st.warning("At least one numeric feature and 10 rows are required for regression.")
-
-# ---------------------------------------------------------
-# 5. CLASSIFICATION
-# ---------------------------------------------------------
-st.header("5. Classification - High vs Normal Demand")
-
-clf_features = numeric_features(df, demand_col)
-
-if len(clf_features.columns) >= 1 and len(df) >= 10:
-    clf_data = pd.concat([clf_features, df[demand_col]], axis=1).dropna()
-
-    if len(clf_data) >= 10:
-        threshold = clf_data[demand_col].median()
-
-        clf_data["DemandClass"] = np.where(
-            clf_data[demand_col] >= threshold,
-            1,
-            0,
-        )
-
-        X = clf_data.drop(columns=[demand_col, "DemandClass"])
-        y = clf_data["DemandClass"]
-
-        if y.nunique() >= 2:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X,
-                y,
-                test_size=0.2,
-                random_state=42,
-                stratify=y,
+        if missing:
+            st.session_state["ev_source_df"] = None
+            st.session_state["ev_source_name"] = None
+            st.session_state["ev_source_signature"] = None
+            st.session_state["ev_filters"] = None
+            st.error(
+                "This does not appear to be the EV charging dataset. "
+                "Required columns missing: " + ", ".join(missing)
             )
-
-            clf_model = RandomForestClassifier(
-                n_estimators=100,
-                random_state=42,
+            st.write("Columns found in your CSV:", list(loaded.columns))
+            st.info(
+                "Use the EV dataset containing Demand, Location, and ChargerType. "
+                "A credit portfolio dataset will not work in this dashboard."
             )
-            clf_model.fit(X_train, y_train)
-            clf_predictions = clf_model.predict(X_test)
-
-            accuracy = accuracy_score(y_test, clf_predictions)
-            precision = precision_score(
-                y_test,
-                clf_predictions,
-                zero_division=0,
-            )
-            recall = recall_score(
-                y_test,
-                clf_predictions,
-                zero_division=0,
-            )
-            f1 = f1_score(
-                y_test,
-                clf_predictions,
-                zero_division=0,
-            )
-
-            metric1, metric2, metric3, metric4 = st.columns(4)
-            metric1.metric("Accuracy", f"{accuracy:.2f}")
-            metric2.metric("Precision", f"{precision:.2f}")
-            metric3.metric("Recall", f"{recall:.2f}")
-            metric4.metric("F1 Score", f"{f1:.2f}")
-
-            class_counts = (
-                clf_data["DemandClass"]
-                .map({0: "Normal Demand", 1: "High Demand"})
-                .value_counts()
-                .reset_index()
-            )
-            class_counts.columns = ["Demand Class", "Count"]
-
-            fig = px.bar(
-                class_counts,
-                x="Demand Class",
-                y="Count",
-                title="Demand Class Distribution",
-            )
-            fig.update_layout(height=350)
-            st.plotly_chart(fig, width="stretch")
         else:
-            st.warning("The Demand values create only one class.")
-    else:
-        st.warning("Not enough valid data for classification.")
-else:
-    st.warning("At least one numeric feature and 10 rows are required for classification.")
+            loaded["Demand"] = pd.to_numeric(loaded["Demand"], errors="coerce")
+            if "Duration" in loaded.columns:
+                loaded["Duration"] = pd.to_numeric(loaded["Duration"], errors="coerce")
 
-# ---------------------------------------------------------
-# 6. TIME SERIES
-# ---------------------------------------------------------
-st.header("6. Time Series Analysis")
+            if "StartDatetime" in loaded.columns:
+                loaded["StartDatetime"] = pd.to_datetime(
+                    loaded["StartDatetime"], errors="coerce"
+                )
+            elif "StartDate" in loaded.columns:
+                loaded["StartDatetime"] = pd.to_datetime(
+                    loaded["StartDate"], errors="coerce"
+                )
 
-if "AnalysisDatetime" in df.columns:
-    time_data = (
-        df.dropna(subset=["AnalysisDatetime"])
-        .set_index("AnalysisDatetime")[demand_col]
-        .resample("D")
-        .mean()
-        .reset_index()
+            if "StartDatetime" in loaded.columns:
+                dt = loaded["StartDatetime"]
+                if "Hour" not in loaded.columns:
+                    loaded["Hour"] = dt.dt.hour
+                if "DayOfWeek" not in loaded.columns:
+                    loaded["DayOfWeek"] = dt.dt.dayofweek
+                if "DayName" not in loaded.columns:
+                    loaded["DayName"] = dt.dt.day_name()
+                if "Month" not in loaded.columns:
+                    loaded["Month"] = dt.dt.month
+                if "Year" not in loaded.columns:
+                    loaded["Year"] = dt.dt.year
+                if "IsWeekend" not in loaded.columns:
+                    loaded["IsWeekend"] = dt.dt.dayofweek.isin([5, 6]).astype("Int64")
+
+            invalid_demand = int(loaded["Demand"].isna().sum())
+            loaded = loaded.dropna(subset=["Demand"]).copy()
+
+            if loaded.empty:
+                st.session_state["ev_source_df"] = None
+                st.error("No valid numeric Demand values were found in the CSV.")
+            else:
+                st.session_state["ev_source_df"] = loaded
+                st.session_state["ev_source_name"] = selected_name
+                st.session_state["ev_source_signature"] = signature
+                st.session_state["ev_filters"] = None
+                st.session_state["ev_invalid_demand"] = invalid_demand
+                st.success(
+                    f"Loaded {selected_name}: {len(loaded):,} valid rows. "
+                    "Use the filters below and click Apply filters."
+                )
+    except Exception as exc:
+        st.error(f"Could not read the CSV file: {exc}")
+
+source_df = st.session_state.get("ev_source_df")
+
+if source_df is None:
+    st.info(
+        "Choose or upload your EV charging CSV in the sidebar, then click **Run analysis**."
     )
+    st.stop()
 
-    if len(time_data) >= 2:
-        time_data["7-Day Moving Average"] = (
-            time_data[demand_col]
-            .rolling(window=7, min_periods=1)
-            .mean()
-        )
+st.sidebar.caption(f"Loaded dataset: {st.session_state['ev_source_name']}")
+st.sidebar.caption(f"Records loaded: {len(source_df):,}")
 
-        fig = px.line(
-            time_data,
-            x="AnalysisDatetime",
-            y=[demand_col, "7-Day Moving Average"],
-            title="Daily Demand Trend and 7-Day Moving Average",
-            labels={"value": "Demand", "AnalysisDatetime": "Date"},
-        )
-        fig.update_layout(height=380)
-        st.plotly_chart(fig, width="stretch")
+# ------------------------------------------------------------
+# 3. Filters with an Apply button
+# ------------------------------------------------------------
+st.sidebar.header("Filters")
+with st.sidebar.form("ev_filter_form"):
+    all_locations = sorted(source_df["Location"].dropna().astype(str).unique().tolist())
+    all_types = sorted(source_df["ChargerType"].dropna().astype(str).unique().tolist())
 
-        # Simple future forecast using a linear trend.
-        if len(time_data) >= 3:
-            forecast_days = 7
-            x = np.arange(len(time_data))
-            y = time_data[demand_col].values
+    current_filters = st.session_state.get("ev_filters") or {}
+    default_locations = current_filters.get("locations", all_locations)
+    default_types = current_filters.get("types", all_types)
 
-            slope, intercept = np.polyfit(x, y, 1)
+    # If a new CSV is loaded, make sure stored selections still exist.
+    default_locations = [v for v in default_locations if v in all_locations]
+    default_types = [v for v in default_types if v in all_types]
 
-            future_x = np.arange(
-                len(time_data),
-                len(time_data) + forecast_days,
-            )
-
-            future_dates = pd.date_range(
-                time_data["AnalysisDatetime"].max() + pd.Timedelta(days=1),
-                periods=forecast_days,
-                freq="D",
-            )
-
-            forecast_values = slope * future_x + intercept
-
-            forecast_df = pd.DataFrame(
-                {
-                    "Date": future_dates,
-                    "Forecast Demand": forecast_values,
-                }
-            )
-
-            fig = px.line(
-                forecast_df,
-                x="Date",
-                y="Forecast Demand",
-                markers=True,
-                title="7-Day Demand Forecast",
-            )
-            fig.update_layout(height=350)
-            st.plotly_chart(fig, width="stretch")
-
-            st.dataframe(forecast_df, width="stretch")
-    else:
-        st.warning("Not enough datetime information for time-series analysis.")
-else:
-    st.warning(
-        "Datetime information was not found. Time-series analysis "
-        "requires a StartDatetime or date/time column."
+    selected_locations = st.multiselect(
+        "Location",
+        options=all_locations,
+        default=default_locations,
+        help="Choose one or more locations. Select all to include every location.",
     )
+    selected_types = st.multiselect(
+        "Charger type",
+        options=all_types,
+        default=default_types,
+        help="Choose one or more charger types.",
+    )
+    apply_filters = st.form_submit_button("Apply filters", use_container_width=True)
 
-# ---------------------------------------------------------
-# 7. FEATURE IMPORTANCE
-# ---------------------------------------------------------
-st.header("7. Feature Importance")
+if apply_filters or st.session_state.get("ev_filters") is None:
+    st.session_state["ev_filters"] = {
+        "locations": selected_locations,
+        "types": selected_types,
+    }
 
-importance_features = numeric_features(df, demand_col)
+filters = st.session_state["ev_filters"]
+filtered = source_df[
+    source_df["Location"].astype(str).isin(filters["locations"])
+    & source_df["ChargerType"].astype(str).isin(filters["types"])
+].copy()
 
-if len(importance_features.columns) >= 1 and len(df) >= 10:
-    importance_data = pd.concat(
-        [importance_features, df[demand_col]],
-        axis=1,
-    ).dropna()
+if st.sidebar.button("Reset filters", use_container_width=True):
+    st.session_state["ev_filters"] = {
+        "locations": all_locations,
+        "types": all_types,
+    }
+    st.rerun()
 
-    if len(importance_data) >= 10:
-        X = importance_data.drop(columns=[demand_col])
-        y = importance_data[demand_col]
+if filtered.empty:
+    st.warning("No rows match your filters. Select at least one location and charger type, then click Apply filters.")
+    st.stop()
 
-        importance_model = RandomForestRegressor(
-            n_estimators=100,
-            random_state=42,
-        )
-        importance_model.fit(X, y)
-
-        importance_df = pd.DataFrame(
-            {
-                "Feature": X.columns,
-                "Importance": importance_model.feature_importances_,
-            }
-        ).sort_values("Importance", ascending=False)
-
-        fig = px.bar(
-            importance_df,
-            x="Importance",
-            y="Feature",
-            orientation="h",
-            title="Random Forest Feature Importance",
-        )
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.warning("Not enough data for feature importance.")
+# ------------------------------------------------------------
+# 4. Summary cards
+# ------------------------------------------------------------
+st.subheader("Dataset overview")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Charging records", f"{len(filtered):,}")
+m2.metric("Average demand", f"{filtered['Demand'].mean():,.2f}")
+m3.metric("Highest demand", f"{filtered['Demand'].max():,.2f}")
+if "Duration" in filtered.columns and filtered["Duration"].notna().any():
+    m4.metric("Average duration", f"{filtered['Duration'].mean():,.2f}")
 else:
-    st.warning("Numeric features are required for feature importance.")
+    m4.metric("Locations selected", f"{filtered['Location'].nunique():,}")
 
-# ---------------------------------------------------------
-# 8. PROJECT SUMMARY
-# ---------------------------------------------------------
-st.header("8. Project Summary")
-
-st.markdown(
-    """
-    **Project objective:** Analyze EV charging usage patterns and predict
-    charging demand.
-
-    **Main steps completed:**
-    - Uploaded and validated the CSV dataset
-    - Removed duplicate rows and handled data types
-    - Created date/time features
-    - Performed exploratory data analysis
-    - Built a Random Forest regression model for demand prediction
-    - Built a Random Forest classification model for High/Normal Demand
-    - Analyzed daily demand trends and a 7-day moving average
-    - Generated a simple 7-day demand forecast
-    - Displayed Random Forest feature importance
-    - Presented the complete analysis through Streamlit
-    """
+st.caption(
+    f"Dataset: {st.session_state['ev_source_name']} · "
+    f"{len(filtered):,} records after filtering"
 )
 
-st.success("EV Charging Demand Analysis completed successfully.")
+# ------------------------------------------------------------
+# 5. Charts
+# ------------------------------------------------------------
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Average demand by hour")
+    if "Hour" in filtered.columns and filtered["Hour"].notna().any():
+        hourly = filtered.groupby("Hour")["Demand"].mean().sort_index()
+        st.bar_chart(hourly)
+    else:
+        st.info("Hour information is unavailable in this dataset.")
+
+with right:
+    st.subheader("Average demand by charger type")
+    by_type = filtered.groupby("ChargerType")["Demand"].mean().sort_values(ascending=False)
+    st.bar_chart(by_type)
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Average demand by location")
+    by_location = filtered.groupby("Location")["Demand"].mean().sort_values(ascending=False)
+    st.bar_chart(by_location)
+
+with right:
+    st.subheader("Average demand by day of week")
+    if "DayName" in filtered.columns:
+        order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        by_day = filtered.groupby("DayName")["Demand"].mean().reindex(order).dropna()
+        st.bar_chart(by_day)
+    elif "DayOfWeek" in filtered.columns:
+        st.bar_chart(filtered.groupby("DayOfWeek")["Demand"].mean().sort_index())
+    else:
+        st.info("Day-of-week information is unavailable.")
+
+st.subheader("Monthly average demand")
+if "StartDatetime" in filtered.columns and filtered["StartDatetime"].notna().any():
+    monthly_df = filtered.dropna(subset=["StartDatetime"]).copy()
+    monthly_df["MonthDate"] = monthly_df["StartDatetime"].dt.to_period("M").astype(str)
+    st.line_chart(monthly_df.groupby("MonthDate")["Demand"].mean().sort_index())
+elif "Month" in filtered.columns:
+    st.line_chart(filtered.groupby("Month")["Demand"].mean().sort_index())
+else:
+    st.info("Date information is unavailable for monthly trends.")
+
+# ------------------------------------------------------------
+# 6. Data quality and downloadable filtered rows
+# ------------------------------------------------------------
+st.subheader("Data quality checks")
+q1, q2, q3 = st.columns(3)
+q1.metric("Duplicate rows remaining", f"{int(filtered.duplicated().sum()):,}")
+q2.metric(
+    "Negative duration records",
+    f"{int((filtered['Duration'] < 0).sum()):,}" if "Duration" in filtered.columns else "N/A",
+)
+q3.metric("Negative demand records", f"{int((filtered['Demand'] < 0).sum()):,}")
+st.caption("Negative duration values are flagged for review; they are not automatically removed.")
+
+st.subheader("Filtered charging records")
+st.dataframe(filtered.head(500), use_container_width=True)
+
+st.download_button(
+    "Download filtered EV data",
+    data=filtered.to_csv(index=False).encode("utf-8"),
+    file_name="EV_Charging_Filtered_Data.csv",
+    mime="text/csv",
+)
